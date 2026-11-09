@@ -1,0 +1,8 @@
+{
+  "rolling_archive": {
+    "enabled": true,
+    "stage": "done",
+    "keep": 40,
+    "max_per_run": 20
+  }
+}
