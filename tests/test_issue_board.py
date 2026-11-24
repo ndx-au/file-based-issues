@@ -5,10 +5,13 @@ import importlib.util
 import io
 import json
 import shutil
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -316,6 +319,82 @@ class IssueBoardTests(unittest.TestCase):
         self.assertTrue(
             any(line.startswith("bad options.json:") for line in do.check_board(self.root))
         )
+
+    def test_rolling_archive_leaves_invalid_issues_visible(self):
+        self.write_options(keep=0)
+        path = self.root / do.create_issue(self.root, "done/invalid", "Invalid")
+        path.write_text(path.read_text().replace("title:", "summary:"), encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(do.main(["--check"], root=self.root), 1)
+        self.assertIn("missing front matter key: title", errors.getvalue())
+        self.assertTrue(path.exists())
+
+    def test_validation_edges(self):
+        fields, errors = do.parse_fields("blocked_by:\n  - first\n\nowner: @ada")
+        self.assertEqual(errors, [])
+        self.assertEqual(fields["owner"], "@ada")
+        self.assertFalse(do.valid_timestamp("2026-02-31T00:00:00Z"))
+        for action in ("--new", "--archive", "--restore"):
+            with self.subTest(action=action), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(do.main([action, ""], root=self.root), 1)
+        with self.assertRaises(do.BoardError):
+            do.create_issue(self.root, "inbox/line", "First\u2028Second")
+
+    def test_linked_stage_is_refused(self):
+        with tempfile.TemporaryDirectory() as outside:
+            try:
+                (self.root / "linked").symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symbolic links unavailable: {exc}")
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(do.main(["--new", "linked/item", "--title", "Item"],
+                                         root=self.root), 1)
+            self.assertIn("stage is a symbolic link", errors.getvalue())
+            self.assertEqual(list(Path(outside).iterdir()), [])
+
+    def test_restore_failure_preserves_archive(self):
+        for name in ("one", "two"):
+            do.create_issue(self.root, f"done/{name}", name)
+        do.archive_issues(self.root, "one,two")
+        with mock.patch.object(do, "write_archive", side_effect=OSError("write failed")):
+            with self.assertRaises(OSError):
+                do.restore_issues(self.root, "one,two")
+        self.assertEqual(do.list_issues(self.root), [])
+        self.assertEqual(len(do.restore_issues(self.root, "one,two")), 2)
+
+    def test_archive_unlink_failure_keeps_remaining_issues_live(self):
+        for name in ("one", "two"):
+            do.create_issue(self.root, f"done/{name}", name)
+        original = Path.unlink
+
+        def refuse_second(path, *args, **kwargs):
+            if path.name == "two.md":
+                raise PermissionError("read-only")
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", refuse_second):
+            with self.assertRaises(do.BoardError):
+                do.archive_issues(self.root, "one,two")
+        self.assertEqual(do.list_issues(self.root), ["done/two"])
+        self.assertEqual(set(do.scan_archives(self.root)[0]), {"one"})
+        self.assertEqual(do.check_board(self.root), [])
+
+    def test_concurrent_archive_commands_keep_every_issue(self):
+        script = shutil.copy(REPO / ".issues" / "do.py", self.root)
+        names = [f"item-{number}" for number in range(8)]
+        for name in names:
+            do.create_issue(self.root, f"done/{name}", name)
+        processes = [
+            subprocess.Popen([sys.executable, script, "--archive", name],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            for name in names
+        ]
+        results = [process.communicate(timeout=30) for process in processes]
+        self.assertEqual([p.returncode for p in processes], [0] * len(names), results)
+        index, errors = do.scan_archives(self.root)
+        self.assertEqual(errors, [])
+        self.assertEqual(set(index), set(names))
+        self.assertEqual(do.list_issues(self.root), [])
 
     def test_shipped_rolling_options(self):
         settings, errors = do.parse_rolling_options(REPO / ".issues")

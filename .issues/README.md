@@ -70,7 +70,7 @@ To record a person, add `.issues/_people/<nickname>.md`. The nickname uses the s
 
 ## Commands
 
-Run these from anywhere. The board is the directory that contains `do.py`. `python3` means any Python 3.9+ interpreter.
+Run these examples from the project root. From another directory, pass the path to the board’s `do.py`. Concurrent commands on the same local board take turns, including during rolling archive. `python3` means any Python 3.9+ interpreter.
 
 ```bash
 python3 .issues/do.py --new backlog/export-notes --title "Export the monthly notes"
@@ -115,4 +115,4 @@ Create, move, archive, and restore through `do.py`. Edit the title, body, `updat
 }
 ```
 
-When `enabled` is true, the command counts issues in `stage` and archives the oldest ones by `updated` until `keep` remain, at most `max_per_run` each run. The shipped file keeps the 40 newest `done` issues. Set `enabled` to false to leave every finished issue on the board. Other top-level keys are left for a project to define; keys inside `rolling_archive` are only `enabled`, `stage`, `keep`, and `max_per_run`.
+When `enabled` is true, the command counts issues in `stage` and archives the oldest ones by `updated` until `keep` remain, at most `max_per_run` each run. Issues with invalid front matter stay on the board for `--check` to report. The shipped file keeps the 40 newest `done` issues. Set `enabled` to false to leave every finished issue on the board. Other top-level keys are left for a project to define; keys inside `rolling_archive` are only `enabled`, `stage`, `keep`, and `max_per_run`.

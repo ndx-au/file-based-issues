@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import tarfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,7 +39,17 @@ def board_root():
 
 
 def rel(root, path):
-    return Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
+    return Path(path).relative_to(root).as_posix()
+
+
+def valid_timestamp(value):
+    if not TIMESTAMP.fullmatch(value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
 
 
 def utc_stamp(now=None):
@@ -48,7 +59,7 @@ def utc_stamp(now=None):
         if now.tzinfo is not None:
             now = now.astimezone(timezone.utc)
         return now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    if isinstance(now, str) and TIMESTAMP.fullmatch(now):
+    if isinstance(now, str) and valid_timestamp(now):
         return now
     raise BoardError(f"bad timestamp: {now}")
 
@@ -88,6 +99,9 @@ def stage_dirs(root):
         for path in root.iterdir()
         if path.is_dir() and not path.name.startswith((".", "_"))
     ]
+    for path in found:
+        if path.is_symlink():
+            raise BoardError(f"stage is a symbolic link: {path.name}")
     return sorted(found, key=lambda path: path.name)
 
 
@@ -99,6 +113,8 @@ def require_stage(root, stage):
     if not SLUG.fullmatch(stage or ""):
         raise BoardError(f"bad stage name: {stage}")
     path = Path(root) / stage
+    if path.is_symlink():
+        raise BoardError(f"stage is a symbolic link: {stage}")
     if not path.is_dir():
         known = ", ".join(stage_names(root)) or "(none)"
         raise BoardError(f"unknown stage: {stage} (stages: {known})")
@@ -126,7 +142,7 @@ def clean_title(title):
     if not isinstance(title, str) or title.strip() == "":
         raise BoardError("title is empty")
     title = title.strip()
-    if any(char in title for char in ("\n", "\r", "{{")):
+    if len(title.splitlines()) != 1 or "{{" in title:
         raise BoardError("title must be a single line")
     return title
 
@@ -135,7 +151,11 @@ def issue_files(root):
     files = []
     for stage in stage_dirs(root):
         children = sorted(stage.iterdir(), key=lambda path: path.name)
-        files.extend(path for path in children if path.is_file() and path.suffix == ".md")
+        for path in children:
+            if path.suffix == ".md" and path.is_symlink():
+                raise BoardError(f"issue is a symbolic link: {rel(root, path)}")
+            if path.suffix == ".md" and path.is_file():
+                files.append(path)
     return files
 
 
@@ -205,9 +225,9 @@ def parse_fields(front_matter):
             while index < len(lines) and lines[index].startswith("  - "):
                 items.append(unquote_scalar(lines[index][4:].strip()))
                 index += 1
-            if index < len(lines) and lines[index][:1] in " \t":
+            if index < len(lines) and lines[index].startswith((" ", "\t")):
                 errors.append(f"{key} has an unsupported value")
-                while index < len(lines) and lines[index][:1] in " \t":
+                while index < len(lines) and lines[index].startswith((" ", "\t")):
                     index += 1
             fields[key] = items
             continue
@@ -240,18 +260,15 @@ def render_template(template, issue_id, title, stage, stamp):
     return text
 
 
-def write_exclusive(path, text):
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    descriptor = os.open(path, flags, 0o644)
-    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-        stream.write(text)
-
-
 def write_exclusive_bytes(path, payload):
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     descriptor = os.open(path, flags, 0o644)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(payload)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+    except OSError:
+        path.unlink()
+        raise
 
 
 def create_issue(root, spec, title, now=None):
@@ -282,7 +299,7 @@ def create_issue(root, spec, title, now=None):
     )
     destination = root / stage / f"{issue_id}.md"
     try:
-        write_exclusive(destination, rendered)
+        write_exclusive_bytes(destination, rendered.encode("utf-8"))
     except FileExistsError:
         raise BoardError(f"issue already exists: {rel(root, destination)}") from None
     return rel(root, destination)
@@ -307,10 +324,14 @@ def move_issue(root, issue_id, stage, now=None):
         raise BoardError(f"{exc} in {rel(root, source)}") from exc
     rendered = f"---\n{front_matter}\n---\n{body}"
     try:
-        write_exclusive(destination, rendered)
+        write_exclusive_bytes(destination, rendered.encode("utf-8"))
     except FileExistsError:
         raise BoardError(f"issue already exists: {rel(root, destination)}") from None
-    source.unlink()
+    try:
+        source.unlink()
+    except OSError:
+        destination.unlink()
+        raise
     return rel(root, destination)
 
 
@@ -378,6 +399,10 @@ def _check_issue(root, path, ids):
     if parts is None:
         return [f"missing front matter: {relative}"]
     fields, parse_errors = parse_fields(parts[0])
+    return _check_fields(path, relative, ids, fields, parse_errors)
+
+
+def _check_fields(path, relative, ids, fields, parse_errors):
     messages = [f"{message} in {relative}" for message in parse_errors]
     for key in REQUIRED_KEYS:
         if not isinstance(fields.get(key), str):
@@ -393,7 +418,7 @@ def _check_issue(root, path, ids):
         messages.append(f"title is empty: {relative}")
     for key in ("created", "updated"):
         value = fields.get(key)
-        if isinstance(value, str) and TIMESTAMP.fullmatch(value) is None:
+        if isinstance(value, str) and not valid_timestamp(value):
             messages.append(f"bad timestamp for {key}: {relative}")
     if "owner" in fields and (
         not isinstance(fields["owner"], str) or NICKNAME.fullmatch(fields["owner"]) is None
@@ -484,20 +509,19 @@ def _member_identity(name):
 def read_archive(path, label):
     members = {}
     try:
-        bundle = tarfile.open(path, "r:bz2")
+        with tarfile.open(path, "r:bz2") as bundle:
+            for member in bundle.getmembers():
+                issue_id, stage = _member_identity(member.name)
+                if issue_id is None or not member.isfile():
+                    raise BoardError(f"bad archive member: {label} has {member.name}")
+                extracted = bundle.extractfile(member)
+                if extracted is None:
+                    raise BoardError(f"bad archive member: {label} has {member.name}")
+                if issue_id in members:
+                    raise BoardError(f"duplicate archived issue {issue_id}: {label}")
+                members[issue_id] = (stage, extracted.read())
     except (tarfile.TarError, OSError, EOFError) as exc:
         raise BoardError(f"unreadable archive: {label}") from exc
-    with bundle:
-        for member in bundle.getmembers():
-            issue_id, stage = _member_identity(member.name)
-            if issue_id is None or not member.isfile():
-                raise BoardError(f"bad archive member: {label} has {member.name}")
-            extracted = bundle.extractfile(member)
-            if extracted is None:
-                raise BoardError(f"bad archive member: {label} has {member.name}")
-            if issue_id in members:
-                raise BoardError(f"duplicate archived issue {issue_id}: {label}")
-            members[issue_id] = (stage, extracted.read())
     return members
 
 
@@ -522,8 +546,11 @@ def write_archive(path, members):
         return
     path.parent.mkdir(exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_bytes(_tar_bytes(members))
-    temporary.replace(path)
+    write_exclusive_bytes(temporary, _tar_bytes(members))
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def scan_archives(root):
@@ -531,13 +558,15 @@ def scan_archives(root):
     folder = root / "_archive"
     index = {}
     errors = []
+    if folder.is_symlink():
+        return index, ["archive folder is a symbolic link: _archive"]
     if not folder.exists():
         return index, errors
     if not folder.is_dir():
         return index, ["bad archive name: _archive"]
     for path in sorted(folder.iterdir(), key=lambda item: item.name):
         relative = rel(root, path)
-        if not path.is_file() or ARCHIVE_NAME.fullmatch(path.name) is None:
+        if path.is_symlink() or not path.is_file() or ARCHIVE_NAME.fullmatch(path.name) is None:
             errors.append(f"bad archive name: {relative}")
             continue
         try:
@@ -626,11 +655,14 @@ def archive_issues(root, ids, now=None):
         members[source.stem] = (source.parent.name, source.read_bytes())
         lines.append(f"{source.parent.name}/{source.stem}.md -> {label}")
     write_archive(bundle, members)
-    for source in sources:
+    for position, source in enumerate(sources):
         try:
             source.unlink()
         except OSError as exc:
-            raise BoardError(f"archived but not removed: {rel(root, source)}: {exc.strerror}") from exc
+            for remaining in sources[position:]:
+                del members[remaining.stem]
+            write_archive(bundle, members)
+            raise BoardError(f"could not archive {rel(root, source)}: {exc.strerror}") from exc
     return lines
 
 
@@ -655,27 +687,30 @@ def restore_issues(root, ids):
             raise BoardError(f"issue already exists: {rel(root, live)}")
         by_bundle.setdefault(index[issue_id], []).append(issue_id)
     loaded = {}
-    planned = []
     for bundle_rel, issue_ids in by_bundle.items():
         members = read_archive(root / bundle_rel, bundle_rel)
         loaded[bundle_rel] = members
         for issue_id in issue_ids:
-            stage, payload = members[issue_id]
-            require_stage(root, stage)
-            planned.append((bundle_rel, issue_id, stage, payload))
+            require_stage(root, members[issue_id][0])
     lines = []
-    for bundle_rel, issue_id, stage, payload in planned:
-        destination = root / stage / f"{issue_id}.md"
-        try:
-            write_exclusive_bytes(destination, payload)
-        except FileExistsError:
-            raise BoardError(f"issue already exists: {stage}/{issue_id}.md") from None
-        lines.append(f"{bundle_rel} -> {stage}/{issue_id}.md")
     for bundle_rel, issue_ids in by_bundle.items():
         members = loaded[bundle_rel]
-        for issue_id in issue_ids:
-            del members[issue_id]
-        write_archive(root / bundle_rel, members)
+        written = []
+        try:
+            for issue_id in issue_ids:
+                stage, payload = members.pop(issue_id)
+                destination = root / stage / f"{issue_id}.md"
+                try:
+                    write_exclusive_bytes(destination, payload)
+                except FileExistsError:
+                    raise BoardError(f"issue already exists: {stage}/{issue_id}.md") from None
+                written.append(destination)
+                lines.append(f"{bundle_rel} -> {stage}/{issue_id}.md")
+            write_archive(root / bundle_rel, members)
+        except (BoardError, OSError):
+            for destination in written:
+                destination.unlink()
+            raise
     return lines
 
 
@@ -691,6 +726,7 @@ def apply_rolling_archive(root, now=None):
     if archive_errors:
         raise BoardError(archive_errors[0])
     candidates = []
+    ids = valid_issue_ids(root) | set(index)
     for path in issue_files(root):
         if path.parent.name != settings["stage"] or not valid_slug(path.stem):
             continue
@@ -703,23 +739,37 @@ def apply_rolling_archive(root, now=None):
         parts = split_document(text)
         if parts is None:
             continue
-        fields, parse_errors = parse_fields(parts[0])
-        updated = fields.get("updated")
-        if (
-            parse_errors
-            or not isinstance(updated, str)
-            or TIMESTAMP.fullmatch(updated) is None
-            or fields.get("id") != path.stem
-            or fields.get("status") != settings["stage"]
-        ):
+        fields, errors = parse_fields(parts[0])
+        if _check_fields(path, rel(root, path), ids, fields, errors):
             continue
-        candidates.append((updated, path.stem))
+        candidates.append((fields["updated"], path.stem))
     candidates.sort()
     overflow = len(candidates) - settings["keep"]
     if overflow <= 0:
         return []
     chosen = [issue_id for _updated, issue_id in candidates[: min(overflow, settings["max_per_run"])]]
     return archive_issues(root, chosen, now=now)
+
+
+@contextmanager
+def board_lock(root):
+    """Serialize CLI commands, including their rolling archive pass."""
+    if os.name == "nt":
+        import msvcrt
+
+        with (root / ".board.lock").open("a+b") as stream:
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            yield
+    else:
+        import fcntl
+
+        descriptor = os.open(root, os.O_RDONLY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
 
 
 def main(argv=None, root=None, now=None):
@@ -735,33 +785,38 @@ def main(argv=None, root=None, now=None):
     args = parser.parse_args(argv)
     root = Path(root) if root is not None else board_root()
     try:
-        if args.title is not None and not args.new:
-            raise BoardError("--title is only valid with --new")
-        for line in apply_rolling_archive(root, now=now):
-            print(line, file=sys.stderr)
-        if args.new:
-            if not args.title:
-                raise BoardError("missing --title")
-            print(create_issue(root, args.new, args.title, now=now))
-        elif args.move:
-            print(move_issue(root, args.move[0], args.move[1], now=now))
-        elif args.list is not None:
-            for line in list_issues(root, args.list or None):
-                print(line)
-        elif args.check:
-            problems = check_board(root)
-            if problems:
-                print("\n".join(problems), file=sys.stderr)
-                return 1
-        elif args.archive:
-            for line in archive_issues(root, args.archive, now=now):
-                print(line)
-        elif args.restore:
-            for line in restore_issues(root, args.restore):
-                print(line)
-    except BoardError as exc:
+        with board_lock(root):
+            return run_command(args, root, now)
+    except (BoardError, OSError, UnicodeError) as exc:
         print(exc, file=sys.stderr)
         return 1
+
+
+def run_command(args, root, now):
+    if args.title is not None and args.new is None:
+        raise BoardError("--title is only valid with --new")
+    for line in apply_rolling_archive(root, now=now):
+        print(line, file=sys.stderr)
+    if args.new is not None:
+        if not args.title:
+            raise BoardError("missing --title")
+        print(create_issue(root, args.new, args.title, now=now))
+    elif args.move:
+        print(move_issue(root, args.move[0], args.move[1], now=now))
+    elif args.list is not None:
+        for line in list_issues(root, args.list or None):
+            print(line)
+    elif args.check:
+        problems = check_board(root)
+        if problems:
+            print("\n".join(problems), file=sys.stderr)
+            return 1
+    elif args.archive is not None:
+        for line in archive_issues(root, args.archive, now=now):
+            print(line)
+    elif args.restore is not None:
+        for line in restore_issues(root, args.restore):
+            print(line)
     return 0
 
 
