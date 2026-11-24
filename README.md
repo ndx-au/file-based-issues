@@ -1,37 +1,39 @@
 # file-based-issues
 
-A project issue tracker made of folders and Markdown files. Python 3 is the only requirement. The standard library is enough: `do.py` installs nothing and opens no network connection.
+A project issue tracker made of Markdown files. In `.issues/doing/export-notes.md`, the folder says the work is in progress, the filename gives it the ID `export-notes`, and the file holds its title, outcome, and notes. The ID stays the same when the issue moves.
 
-The tracker in this repository is the [`.issues/`](.issues/) directory. Copy that directory into the root of the project that needs it.
-
-## Why this exists
-
-Hosted issue trackers assume a Git host, an account, and a service that both people and agents can log into. Plenty of projects do not have that. A tree may live in another version-control system, stay private, or simply be a directory of files. The work list still has to sit next to the work, where an editor can open it and a review can show the diff.
-
-This board keeps that list in the project itself. A status is a folder. An issue is one Markdown file, and the filename is its ID. Progress is moving the file. The full title, dates, and notes stay in the file, so the folder name is enough to see where the work stands.
-
-A short Python script is part of the copy so agents do not invent a second copy of an ID or leave `status` pointing at the wrong folder. People can still read and edit the Markdown. Finished issues can be packed into a monthly `.bz2` archive so a long-lived board does not fill the tree. There is no database, no account, and no daemon.
+The board lives alongside the project, so you can read it in an editor and review issue changes with the code they describe. It works offline with Python 3.9+ and the standard library.
 
 ## Adopt it
 
-An agent implementing this in another project should do only the following:
+1. Copy the [`.issues/` directory](.issues/) into the target project root. Include the script, options, template, both guides, and the `.keep` files in `inbox/`, `backlog/`, `doing/`, and `done/`.
+2. Add this line to the target project's agent instructions so agents use the board consistently.
 
-1. Copy `.issues/` from this repository into the target project root. Keep `do.py`, `options.json`, `_template.md`, `README.md`, `AGENTS.md`, and the stage folders `inbox/`, `backlog/`, `doing/`, and `done/`, including each `.keep` file.
-2. Point the target project's agent instructions at `.issues/AGENTS.md`. State that creating, moving, archiving, and restoring issues go through `python3 .issues/do.py`.
-3. From the target project root, run `python3 .issues/do.py --check`. A new board prints nothing and exits 0.
-4. Leave [`.issues/options.json`](.issues/options.json) as copied unless the project wants a different rolling archive. Set `rolling_archive.enabled` to `false` to keep every finished issue in `done/`.
+   > Follow `.issues/AGENTS.md`. Create, move, list, check, archive, and restore issues with `python3 .issues/do.py`.
 
-Use `python3`, or another Python 3.9+ interpreter. The examples do not depend on a virtual environment. Copy `tests/test_issue_board.py` only when the target has a top-level `tests/` directory beside `.issues/`; the test file finds the script at `../.issues/do.py`. Run it with `python3 -m unittest discover -s tests -v`.
+3. From the target project root, run `python3 .issues/do.py --check`. A fresh board exits successfully with no output.
 
-Create an issue when there is real work:
+## Track a piece of work
+
+Run these commands from the project root.
 
 ```bash
 python3 .issues/do.py --new inbox/export-notes --title "Export the monthly notes"
 python3 .issues/do.py --move export-notes doing
-python3 .issues/do.py --list
+python3 .issues/do.py --list doing
 ```
 
-Human rules for day-to-day use are in [`.issues/README.md`](.issues/README.md). Agent rules are in [`.issues/AGENTS.md`](.issues/AGENTS.md).
+The last command prints `doing/export-notes`. Edit the **Outcome** and **Notes** in `.issues/doing/export-notes.md`, and set `updated` to the current UTC time when you edit. When the work is finished, run `python3 .issues/do.py --move export-notes done`. The script updates the status and timestamp on each move.
+
+Use your roadmap to order work and refer to each issue by ID. If you want a sequence in the IDs themselves, start with a letter, as in `p01-export-notes`. Projects can add front matter fields such as `priority` and document their conventions in an agent skill. See the [board guide](.issues/README.md) and [agent instructions](.issues/AGENTS.md).
+
+## Finished issues
+
+By default, each command checks whether more than 40 eligible issues remain in `done/`. It archives up to 20 of the oldest by `updated` in a monthly bundle. Restore an issue to its previous folder with `python3 .issues/do.py --restore export-notes`. To keep finished issues in place, set `rolling_archive.enabled` to `false` in the [board options](.issues/options.json).
+
+## Tests
+
+Run `python3 -m unittest discover -s tests -v` from this repository's root. To use the same suite in an adopting project, copy [the test file](tests/test_issue_board.py) into a top-level `tests/` directory beside `.issues/`.
 
 ## License
 
